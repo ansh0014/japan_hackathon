@@ -1,29 +1,4 @@
 import { ApiError, GoogleGenAI } from "@google/genai";
-import fs from "fs";
-import path from "path";
-
-function resolveApiKey(): string {
-  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-  try {
-    const candidatePaths = [
-      path.resolve(process.cwd(), ".env.local"),
-      path.resolve(process.cwd(), ".env"),
-      path.resolve(process.cwd(), "../.env"),
-    ];
-    for (const p of candidatePaths) {
-      if (fs.existsSync(p)) {
-        const content = fs.readFileSync(p, "utf-8");
-        const match = content.match(/^GEMINI_API_KEY=(.+)$/m);
-        if (match && match[1].trim()) {
-          const key = match[1].trim();
-          process.env.GEMINI_API_KEY = key;
-          return key;
-        }
-      }
-    }
-  } catch {}
-  return "";
-}
 
 /**
  * Gemini client tuned for the FREE tier: low RPM quotas and frequent
@@ -33,10 +8,10 @@ function resolveApiKey(): string {
  *   3. on 429 waits the server's retryDelay (if short) and retries, else moves on,
  *   4. reports waits to the UI so a slow answer never looks like a hang.
  */
-export const gemini = new GoogleGenAI({ apiKey: resolveApiKey() });
+export const gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 /** Fastest-first. Override with GEMINI_MODELS="a,b,c". */
-export const GEMINI_MODELS = (process.env.GEMINI_MODELS ?? "gemini-2.5-flash,gemini-2.0-flash,gemini-2.5-flash-lite,gemini-1.5-flash")
+export const GEMINI_MODELS = (process.env.GEMINI_MODELS ?? "gemini-3.5-flash,gemini-3.8-flash,gemini-flash-lite-latest")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -84,45 +59,33 @@ export async function withGemini<T>(
         opts.onWait?.(`Free-tier limit reached, continuing in ${Math.ceil(wait / 1000)}s…`);
         await sleep(wait, opts.signal);
       }
-      (calls.get(model) ?? []).push(Date.now());
+      calls.get(model)!.push(Date.now());
       try {
-        const result = await fn(model);
-        return { result, model };
+        return { result: await fn(model), model };
       } catch (err) {
         lastErr = err;
         if (!(err instanceof ApiError)) throw err;
         if (err.status === 429) {
           const d = retryDelayMs(err);
-          if (d && d < MAX_WAIT_MS) {
-            opts.onWait?.(`Model ${model} rate-limited, waiting ${Math.ceil(d / 1000)}s…`);
+          if (d !== null && d <= MAX_WAIT_MS && attempt === 0) {
+            opts.onWait?.(`Free-tier quota busy, retrying in ${Math.ceil(d / 1000)}s…`);
             await sleep(d, opts.signal);
             continue;
           }
-          break; // move to next model
+          break; // long or daily quota: next model
         }
-        if (err.status === 503 || err.status === 500) {
-          const next = GEMINI_MODELS[i + 1];
-          if (next) opts.onSwitch?.(model, next);
-          break; // overloaded; next model immediately
-        }
-        throw err;
+        if (err.status >= 500 || err.status === 404) break; // overloaded / unavailable: next model
+        throw err; // 400/401/403: our bug or bad key, don't mask it
       }
     }
+    if (i + 1 < GEMINI_MODELS.length) opts.onSwitch?.(model, GEMINI_MODELS[i + 1]);
   }
-  throw new AllModelsBusyError("All Gemini models busy", { cause: lastErr });
+  throw lastErr instanceof ApiError ? new AllModelsBusyError(lastErr.message) : lastErr;
 }
 
-/**
- * Strip zod-v4-only keywords (like `exclusiveMinimum`) that the Gemini
- * JSON-schema validator rejects with a 400.
- */
+/** zod's JSON Schema output → shape Gemini accepts. */
 export function toGeminiSchema(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(toGeminiSchema);
-  if (!schema || typeof schema !== "object") return schema;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(schema)) {
-    if (k === "$schema" || k === "additionalProperties") continue;
-    out[k] = toGeminiSchema(v);
-  }
-  return out;
+  const s = structuredClone(schema) as Record<string, unknown>;
+  delete s.$schema;
+  return s;
 }
